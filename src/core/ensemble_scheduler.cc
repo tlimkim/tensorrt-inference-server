@@ -124,7 +124,7 @@ class EnsembleContext {
 
   // Helper function that initialize the 'step' given the info at 'step_idx'.
   // The 'step' will have proper request / response provider for the model
-  Status InitStep(size_t step_idx, std::shared_ptr<Step>* step);
+  Status InitStep(const size_t step_idx, std::shared_ptr<Step>* step);
 
   // Helper function that set the output of the ensemble request if it is ready
   // and valid.
@@ -520,17 +520,29 @@ EnsembleContext::GetNextSteps(
 }
 
 Status
-EnsembleContext::InitStep(size_t step_idx, std::shared_ptr<Step>* step)
+EnsembleContext::InitStep(const size_t step_idx, std::shared_ptr<Step>* step)
 {
-  auto irequest = std::make_shared<InferenceRequest>();
-  auto& version_map = handles_[info_->steps_[step_idx].model_name_];
-  auto& backend = version_map[info_->steps_[step_idx].model_version_];
+  const auto& istep = info_->steps_[step_idx];
+  auto& version_map = handles_[istep.model_name_];
+  auto& backend = version_map[istep.model_version_];
 
   const bool allow_batching = (backend->Config().max_batch_size() > 0);
   size_t batch_size = (allow_batching ? batch_size_ : 0);
 
+  // FIXMEV2 once protocol_version 2 is the only one remove
+  // SetBatchSize and adjust the input/output tensors to have
+  // appropriate shape
+  auto irequest = std::make_shared<InferenceRequest>(
+      istep.model_name_, istep.model_version_, istep.model_version_,
+      1 /* protocol_version */);
+
+  // Request for ensemble model cannot override the timeout values for the
+  // composing models. Thus currently the timeout field in request has no
+  // effect until we support an overall ensemble timeout.
+  irequest->SetTimeoutMicroseconds(0);
+
   // Set inputs in request and prepare input map
-  for (const auto& pair : info_->steps_[step_idx].input_to_tensor_) {
+  for (const auto& pair : istep.input_to_tensor_) {
     const auto& other = std::get<0>(tensor_data_[pair.second]);
     InferenceRequest::Input* input;
     RETURN_IF_ERROR(irequest->AddInput(
@@ -548,21 +560,16 @@ EnsembleContext::InitStep(size_t step_idx, std::shared_ptr<Step>* step)
   }
 
   // Set requested outputs in request header
-  for (const auto& pair : info_->steps_[step_idx].output_to_tensor_) {
-    irequest->RequestOutput(pair.first, 0 /* classification_cnt */);
+  for (const auto& pair : istep.output_to_tensor_) {
+    irequest->AddRequestedOutput(pair.first);
   }
 
-  irequest->SetModelName(info_->steps_[step_idx].model_name_);
-  irequest->SetRequestedModelVersion(info_->steps_[step_idx].model_version_);
   irequest->SetCorrelationId(correlation_id_);
   irequest->SetFlags(flags_);
   irequest->SetBatchSize((batch_size == 0 ? 1 : batch_size));
   irequest->SetPriority(priority_);
-  // Request for ensemble model cannot override the timeout values for the
-  // composing models. Thus currently the timeout field in request has no
-  // effect until we support an overall ensemble timeout.
-  irequest->SetTimeoutMicroseconds(0);
-  RETURN_IF_ERROR(irequest->Normalize(*backend));
+
+  RETURN_IF_ERROR(irequest->PrepareForInference(*backend));
 
   step->reset(new Step(step_idx));
   (*step)->backend_ = backend;
