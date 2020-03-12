@@ -267,7 +267,7 @@ class HTTPAPIServerV2 : public HTTPServerV2Impl {
       const std::string& model_name, const InferRequestHeader& request_header,
       evbuffer* input_buffer,
       TRTSERVER_InferenceRequestProvider* request_provider,
-      AllocPayload* alloc_payload);
+      AllocPayload* alloc_payload, int header_length);
 
   static void OKReplyCallback(evthr_t* thr, void* arg, void* shared);
   static void BADReplyCallback(evthr_t* thr, void* arg, void* shared);
@@ -1101,7 +1101,7 @@ HTTPAPIServerV2::EVBufferToInput(
     const std::string& model_name, const InferRequestHeader& request_header,
     evbuffer* input_buffer,
     TRTSERVER_InferenceRequestProvider* request_provider,
-    AllocPayload* alloc_payload)
+    AllocPayload* alloc_payload, int header_length)
 {
   // Extract individual input data from HTTP body and register in
   // 'request_provider'. The input data from HTTP body is not
@@ -1110,23 +1110,32 @@ HTTPAPIServerV2::EVBufferToInput(
   //
   // Get the addr and size of from the evbuffer.
   int buffer_len = evbuffer_get_length(input_buffer);
-  char json_buffer[buffer_len];
+
+  std::vector<char> complete_buffer(buffer_len);
   ev_ssize_t extracted_size =
-      evbuffer_copyout(input_buffer, &json_buffer, buffer_len);
+      evbuffer_copyout(input_buffer, complete_buffer.data(), buffer_len);
   if (extracted_size != buffer_len) {
     return TRTSERVER_ErrorNew(
         TRTSERVER_ERROR_INVALID_ARG,
-        "failed to parse request buffer into json");
+        "failed to parse request header buffer into json");
   }
 
+  // Extract just the header from the complete buffer
+  std::vector<char> json_buffer;
+  if (header_length == -1) {
+    json_buffer = complete_buffer;
+  } else {
+    std::vector<char>::iterator it = complete_buffer.begin();
+    json_buffer.assign(it, it + header_length);
+  }
   rapidjson::Document document;
   rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
-  document.Parse(json_buffer);
+  document.Parse(json_buffer.data());
   if (document.HasParseError()) {
     return TRTSERVER_ErrorNew(
         TRTSERVER_ERROR_INVALID_ARG,
         std::string(
-            "failed to parse the request buffer: " +
+            "failed to parse the request header buffer: " +
             std::string(GetParseError_En(document.GetParseError())) + " at " +
             std::to_string(document.GetErrorOffset()))
             .c_str());
@@ -1180,11 +1189,16 @@ HTTPAPIServerV2::EVBufferToInput(
       rapidjson::Value::ConstMemberIterator itr =
           request_input.FindMember("parameters");
       if (itr != request_input.MemberEnd()) {
+        if (header_length == -1) {
+          return TRTSERVER_ErrorNew(
+              TRTSERVER_ERROR_INVALID_ARG,
+              "must specify valid 'Infer-Header-Content-Length' in request "
+              "header");
+        }
         const rapidjson::Value& params = itr->value;
-        // int64_t binary_offset = params["binary_data_offset"].GetInt();
-        // Set binary_data_start. Use Inference-Header-Content-Length to get
-        // offset of byte data start.
-        // base = binary_data_start + binary_offset;
+        int64_t binary_offset = params["binary_data_offset"].GetInt();
+        // Use Inference-Header-Content-Length to get offset to binary data.
+        base = complete_buffer.data() + header_length + binary_offset;
         rapidjson::Value::ConstMemberIterator iter =
             params.FindMember("binary_data_size");
         if (iter != params.MemberEnd()) {
@@ -1334,9 +1348,17 @@ HTTPAPIServerV2::HandleInfer(
   if (err == nullptr) {
     std::unique_ptr<InferRequestClass> infer_request(new InferRequestClass(
         req, request_header_protobuf.id(), server_id_, unique_id));
+
+    // Find Inference-Header-Content-Length in header. If missing set to -1
+    int header_length = -1;
+    const char* header_length_c_str =
+        evhtp_kv_find(req->headers_in, "Inference-Header-Content-Length");
+    if (header_length_c_str != NULL) {
+      header_length = std::atoi(header_length_c_str);
+    }
     err = EVBufferToInput(
         model_name, request_header_protobuf, req->buffer_in, request_provider,
-        &infer_request->response_meta_data_);
+        &infer_request->response_meta_data_, header_length);
     if (err == nullptr) {
       // Provide the trace manager object to use for this request, if nullptr
       // then no tracing will be performed.
